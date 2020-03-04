@@ -1,0 +1,54 @@
+---
+- hosts: localhost
+  vars:
+    instance_name: "webserver"
+    zone: "us-central1-1"
+    service_account_file: "/home/nareshbalajia/google-keys.json"
+    project: "gcp-selflearning"
+    auth_kind: "serviceaccount"
+    pub_keys:
+      - https://github.com/3mammoth.keys
+  become: yes
+  tasks:
+  - name: Update GCE Instance Tag Value
+    gce_tag:
+      instance_name: "{{ instance_name }}"
+      tags: test-webserver
+      state: present
+
+  - name: Add User Ray
+    user:
+      name: ray
+
+  - name: Sync Access keys for SSH
+    authorized_key:
+      user: ray
+      state: present
+      key: "{{ item }}"
+    loop: "{{ pub_keys }}"
+
+  - name: Install Nginx and Passenger
+    apt:
+      name:
+        - nginx
+        - passenger
+      state: present
+
+  - name: Remove default HTML page
+    file:
+      path: /var/www/html/index.nginx-debian.html
+      state: absent
+
+  - name: Create index.html
+    file:
+      path: /var/www/html/index.html
+      state: file
+
+  - name: Set index.html
+    shell: |
+      echo 'hello world' >> /var/www/html/index.html
+
+  - name: ReStart nginx
+    service:
+      name: nginx
+      state: restarted
