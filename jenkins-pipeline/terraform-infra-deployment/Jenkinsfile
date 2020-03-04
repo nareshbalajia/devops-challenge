@@ -1,0 +1,116 @@
+node {
+  def credentialsId = 'git-ssh-key'
+  def tf_checkout_dir = 'tf-modules'
+  def tf_state_bucket = "${TF_STATE_BUCKET}"
+  def operation = "${OPERATION}"
+
+  stage("Checking out TerraForm modules repo") {
+    checkout poll:false, scm: [
+      $class: 'GitSCM',
+      branches: [[name: "${TF_GIT_BRANCH}"]],
+      extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: tf_checkout_dir ]],
+      submoduleCfg: [],
+      userRemoteConfigs: [[url: "${TF_GIT_URL}", credentialsId: credentialsId]]
+      ]
+  }
+
+  stage("Install Terraform") {
+    terraform_install()
+  }
+
+  stage("Terraform deployment of the VPC infrastructure") {
+    try {
+      dir("${tf_checkout_dir}/vpc") {
+        def apply = false
+        println("Initializing terraform execution")
+        ansiColor('xterm') {
+          sh("""${JENKINS_HOME}/custom_tools/terraform init -input=false -backend-config="bucket=${TF_STATE_BUCKET}" -backend-config="region=${TF_STATE_BUCKET_REGION}" -backend-config="key=terraform/backend/${TARGET_ACCOUNT}/vpc-infra/vpc_infra/terraform.tfstate" """)
+        }
+
+        println("Validating terraform template syntax")
+        ansiColor('xterm') {
+          sh("""${JENKINS_HOME}/custom_tools/terraform validate -check-variables=true -var-file="vars/${TARGET_ACCOUNT}/${REGION}/terraform.tfvars" """)
+        }
+
+        if(operation == "destroy") {
+          println("Generating Terraform Plan for destroy, Click on below step to see TF Plan")
+          ansiColor('xterm') {
+            sh("""${JENKINS_HOME}/custom_tools/terraform plan -destroy -input=false -out=plan.out -var-file="vars/${TARGET_ACCOUNT}/${REGION}/terraform.tfvars" """)
+          }
+        } else if(operation == "create/update") {
+          println("Generating Terraform Plan, Click on below step to see TF Plan")
+          ansiColor('xterm') {
+            sh("""${JENKINS_HOME}/custom_tools/terraform plan -input=false -out=plan.out -var-file="vars/${TARGET_ACCOUNT}/${REGION}/terraform.tfvars" """)
+          }
+        }
+
+        println("Approval for TF plan")
+        //send slack notification to the channel
+        send_slack_notification()
+        input id:'TFApproval', message: 'Apply Terraform Plan?', ok: 'Apply', submitter: "naresh,howard"
+        apply = true
+
+        //applying plan if set to true
+        if(apply) {
+          if(operation == "destroy") {
+            println("Starting terraform destroy")
+            ansiColor('xterm') {
+              sh("""${JENKINS_HOME}/custom_tools/terraform destroy -auto-approve=true """)
+            }
+          } else if(operation == "create/update") {
+            println("Starting Terraform apply")
+            ansiColor('xterm') {
+              sh("""${JENKINS_HOME}/custom_tools/terraform apply -input=false -auto-approve=true plan.out """)
+            }
+          }
+        }
+      }
+    }
+    catch(err) {
+      println(err)
+      currentBuild.result = 'FAILED'
+    }
+    finally {
+      deleteDir()
+    }
+  }
+}
+
+def terraform_install() {
+  sh("""
+  #! /bin/bash
+
+  if [ ! -d ${JENKINS_HOME}/custom_tools ]; then
+     mkdir -p ${JENKINS_HOME}/custom_tools
+  fi
+
+  if [ ! -f ${JENKINS_HOME}/custom_tools/terraform ]; then
+     sudo apt install -y unzip jq
+     TERRAFORM_VERSION=\$(curl https://api.github.com/repos/hashicorp/terraform/releases/latest | jq '.tag_name' | tr -d '"' | tr -d v)
+     DOWNLOAD_URL=https://releases.hashicorp.com/terraform/\${TERRAFORM_VERSION}/terraform_\${TERRAFORM_VERSION}_linux_amd64.zip
+     echo \$TERRAFORM_VERSION
+     curl -o /tmp/terraform_\$TERRAFORM_VERSION.zip \$DOWNLOAD_URL
+     unzip /tmp/terraform_\$TERRAFORM_VERSION.zip -d $JENKINS_HOME/custom_tools
+     echo "plugin_cache_dir   = \\"$JENKINS_HOME/.terraform.d/plugin-cache\\"" > $JENKINS_HOME/.terraformrc
+  fi
+   """)
+}
+
+def send_slack_notification() {
+  def attachments = [
+        [
+            text: "Approval for Infra pipeline ${env.JOB_NAME}, build- ${env.BUILD_NUMBER}",
+            fallback: 'Click on button to review and accept/reject',
+            color: '#008000',
+            actions: [
+                [
+                  type: "button",
+                  text: "Approve/Reject",
+                  url: "${env.JENKINS_URL}blue/organizations/jenkins/${env.JOB_NAME}/detail/${env.JOB_NAME}/${env.BUILD_NUMBER}/pipeline"
+                ]
+            ]
+        ]
+    ]
+
+    slackSend(channel: '#jenkins-cd-approvals', attachments: attachments)
+}
