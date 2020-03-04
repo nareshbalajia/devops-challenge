@@ -1,0 +1,278 @@
+node("android") {
+  def credentialsId ='git-app-ssh-key'
+  def csadCredentialsId = 'git-ssh-key'
+  def app_checkout_dir = 'android-modules'
+  def lambda_checkout_dir = 'lambda-modules'
+  def secrets_s3_bucket= ''
+  def signing_file_path = ""
+  def google_service_json_path = ""
+  def key_alias = ""
+
+  def scm_vars = ""
+  def build_info = ""
+
+  def flavor_map = [
+    qa: [
+      lint: 'lintQaDebug',
+      test: 'createQaDebugUnitTestCoverageReport',
+      apk_assemble: 'assembleQaRelease'
+    ],
+    dev: [
+      lint: 'lintDevDebug',
+      test: 'createDevDebugUnitTestCoverageReport',
+      apk_assemble: 'assembleDevRelease'
+    ],
+    prod:[
+      lint: 'lintProdDebug',
+      test: 'createProdDebugUnitTestCoverageReport',
+      apk_assemble: 'assembleProdRelease'
+    ]
+  ]
+
+  // variables for apk naming
+  def version = ""
+
+  //slack channel list
+  def slack_channels = ["#jb-automation", "#jb-android-pipeline"]
+
+  // s3 bucket for storing latest workspace
+  def workspace_snapshot_bucket = ''
+
+  stage("Checking out application source modules repo") {
+    scm_vars = checkout poll:true, clearWorkspace: true, scm: [
+      $class: 'GitSCM',
+      branches: [[name: "${APP_GIT_BRANCH}"]],
+      extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: app_checkout_dir ], [$class: 'CleanBeforeCheckout']],
+      submoduleCfg: [],
+      userRemoteConfigs: [[url: "${APP_GIT_URL}", credentialsId: credentialsId]]
+      ]
+
+    // get Get author name and commit message
+    dir(app_checkout_dir) {
+      get_git_author_script = sh(script: "git show -s --pretty=%an", returnStdout: true).trim()
+      get_git_commit_msg_script = sh(script: "git log --format=format:%s -1", returnStdout: true).trim()
+      scm_vars.GIT_COMMIT_AUTHOR = get_git_author_script
+      scm_vars.GIT_COMMIT_MESSAGE = get_git_commit_msg_script
+    }
+  }
+
+  stage("Git Checkout & Build Information") {
+    def build_gradle_file = readFile file: "${app_checkout_dir}/app/build.gradle"
+    def compile_sdk_version = (build_gradle_file =~ /(?<=compileSdkVersion) \d+/)
+    def min_sdk_version = (build_gradle_file =~ /(?<=minSdkVersion) \d+/)
+    def target_sdk_version = (build_gradle_file =~ /(?<=targetSdkVersion) \d+/)
+    def version_code = (build_gradle_file =~ /(?<=versionCode) \d+/)
+    version = (build_gradle_file =~ /(?<=versionName) .+/)
+    version = version[0].trim().replaceAll("^\"|\"\$", "")
+
+    build_info = """
+### Git Info:
+  - Revision: "${scm_vars.GIT_COMMIT}"
+  - Branch: "${scm_vars.GIT_BRANCH }"
+  - Author: "${scm_vars.GIT_COMMIT_AUTHOR}"
+  - Commit Msg: "${scm_vars.GIT_COMMIT_MESSAGE}"
+
+### Build Details:
+  - Build No: "${env.BUILD_NUMBER}"
+  - Version Code: "${version_code[0].trim()}"
+  - Version Name: "${version}"
+  - Build Flavor: "${APP_BUILD_FLAVOR}"
+  - Compile SDK Verion: "${compile_sdk_version[0].trim()}"
+  - Min SDK Version: "${min_sdk_version[0].trim()}"
+  - Target SDK Version: "${target_sdk_version[0].trim()}"
+    """
+
+    println build_info
+  }
+
+  stage("Checking out lambda functions repo") {
+    checkout poll:false, clearWorkspace: true, scm: [
+      $class: 'GitSCM',
+      branches: [[name: "${LAMBDA_FUNCTIONS_GIT_BRANCH}"]],
+      extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: lambda_checkout_dir ], [$class: 'CleanBeforeCheckout']],
+      submoduleCfg: [],
+      userRemoteConfigs: [[url: "${LAMBDA_FUNCTIONS_GIT_URL}", credentialsId: csadCredentialsId]]
+      ]
+  }
+
+
+  stage("Running gradle tasks on source code") {
+    dir(app_checkout_dir) {
+      try {
+        def no_of_retries = 4
+        def current_count = 0
+        def is_unknown_api_error = false
+        def is_install_exception = false
+
+        //download google-services.json and place it in app folder
+        def key_store_file = "${WORKSPACE}/${app_checkout_dir}/app/.jks"
+        def google_service_json_file = "${WORKSPACE}/${app_checkout_dir}/app/google-services.json"
+        s3Download file: key_store_file, bucket: secrets_s3_bucket, path: signing_file_path, force: true
+        s3Download file: google_service_json_file, bucket: secrets_s3_bucket, path: google_service_json_path, force: true
+        withCredentials([string(credentialsId: 'android-audio-release-jks', variable: 'APK_SIGN_TOKEN')]) {
+          sh script: "chmod 777 gradlew"
+          build_status = sh(script: "./gradlew -PkeyAlias=${key_alias} -PkeyPass=${APK_SIGN_TOKEN} -PstoreFile=${key_store_file} -PstorePass=${APK_SIGN_TOKEN} ${flavor_map[APP_BUILD_FLAVOR]['lint']} ${flavor_map[APP_BUILD_FLAVOR]['test']} ${flavor_map[APP_BUILD_FLAVOR]['apk_assemble']}", returnStatus :true)
+          print(build_status)
+
+          // This is for the inconsistent ARM based android emulator issue. We check for unknown API level or APK install exception, and then rerun the Gradle task
+
+          if(build_status != 0) {
+            current_exec_log = currentBuild.rawBuild.log
+            is_unknown_api_error = current_exec_log.contains("Unknown API Level")
+            is_install_exception = current_exec_log.contains("com.android.ddmlib.InstallException")
+          }
+          while(build_status != 0) {
+
+            if(!is_unknown_api_error && !is_install_exception)
+              break
+
+            if(current_count == no_of_retries) {
+              print("Maximum number of retries exceeded, aborting execution")
+              throw new Exception("Errors with Android emulator. Kindly run the pipeline again")
+            }
+            print("Inconsistent Android emulator issues encountered, re-running the gradle build..")
+            sleep(time:60, unit:"SECONDS")
+            build_status = sh(script: "./gradlew -PkeyAlias=${key_alias} -PkeyPass=${APK_SIGN_TOKEN} -PstoreFile=${key_store_file} -PstorePass=${APK_SIGN_TOKEN} ${flavor_map[APP_BUILD_FLAVOR]['lint']} ${flavor_map[APP_BUILD_FLAVOR]['test']} ${flavor_map[APP_BUILD_FLAVOR]['apk_assemble']}", returnStatus :true)
+            print(build_status)
+            if(build_status != 0) {
+              current_count++
+            }
+          }
+          if(build_status != 0) {
+            throw new Exception("Android Build Failed")
+          }
+          else {
+            send_slack_notification(true, "good")
+          }
+        }
+      }
+      catch(Exception e) {
+        print(e)
+        send_slack_notification(false, "danger")
+
+        //upload the workspace to S3
+        //first delete the directory for overwriting
+        s3Delete bucket: "${workspace_snapshot_bucket}", path: "${env.JOB_NAME}/"
+        dir(app_checkout_dir) {
+          // create a zip of workspace
+          sh script: "zip -r Build-${env.BUILD_NUMBER}-Workspace-Snapshot.zip ${WORKSPACE}/${app_checkout_dir}/*"
+
+          //upload the workspace to s3
+          s3Upload bucket: "${workspace_snapshot_bucket}", file: "Build-${env.BUILD_NUMBER}-Workspace-Snapshot.zip", path: "${env.JOB_NAME}/Build-${env.BUILD_NUMBER}-Workspace-Snapshot.zip"
+        }
+
+        error "Build failed, please check the logs"
+      }
+    }
+  }
+
+  stage("Zip Test reports") {
+    dir(app_checkout_dir) {
+      sh script: "zip -r ${env.JOB_NAME}-${env.BUILD_NUMBER}-jacoco_reports.zip app/jacocoHtml/*"
+      sh script: "zip -r ${env.JOB_NAME}-${env.BUILD_NUMBER}-android_test_reports.zip app/build/reports/*"
+    }
+  }
+
+  stage("Upload artifacts and reports to S3") {
+    dir(app_checkout_dir) {
+      //writing content of build_info to README.md file
+      writeFile file: "app/README.md", text: "${build_info}"
+
+      // replace / with - in branch name as it would generate directory paths
+      def branch_name = APP_GIT_BRANCH.replaceAll("/", "-")
+
+      //name the APK as per the following convention "mySound_branchName_flavour_version_buildNo.apk"
+      s3Upload bucket: "${ARTIFACT_BUCKET}", file: "app/build/outputs/apk/${APP_BUILD_FLAVOR}/release/app-${APP_BUILD_FLAVOR}-universal-release.apk", path: "${env.JOB_NAME}/${env.BUILD_NUMBER}/dev-artifacts/${APP_BUILD_FLAVOR}/release/mySound_${branch_name}_${APP_BUILD_FLAVOR}_${version}_${env.BUILD_NUMBER}.apk"
+
+      s3Upload bucket: "${ARTIFACT_BUCKET}", file: "${env.JOB_NAME}-${env.BUILD_NUMBER}-jacoco_reports.zip", path: "${env.JOB_NAME}/${env.BUILD_NUMBER}/reports/jacoco_reports.zip"
+      s3Upload bucket: "${ARTIFACT_BUCKET}", file: "${env.JOB_NAME}-${env.BUILD_NUMBER}-android_test_reports.zip", path: "${env.JOB_NAME}/${env.BUILD_NUMBER}/reports/android_test_reports.zip"
+      s3Upload bucket: "${ARTIFACT_BUCKET}", file: "app/README.md", path: "${env.JOB_NAME}/${env.BUILD_NUMBER}/reports/README.md"
+    }
+  }
+
+  stage("Send reports to Slack Channel") {
+    dir("${lambda_checkout_dir}/slack-upload") {
+      def slack_channel = "jb-android-pipeline"
+      withCredentials([string(credentialsId: 'slack_upload_app', variable: 'SLACK_API')]) {
+        sh """
+          if [ -f requirements.txt ]; then
+            sudo pip3 install -t . -r requirements.txt
+          fi
+          sudo chown -R ubuntu:ubuntu . *
+          sudo python3 slack_upload.py "${WORKSPACE}/${app_checkout_dir}/${env.JOB_NAME}-${env.BUILD_NUMBER}-jacoco_reports.zip" "${slack_channel}" "$SLACK_API"
+          sudo python3 slack_upload.py "${WORKSPACE}/${app_checkout_dir}/${env.JOB_NAME}-${env.BUILD_NUMBER}-android_test_reports.zip" "${slack_channel}" "$SLACK_API"
+          sudo chown -R ubuntu:ubuntu . *
+        """
+      }
+    }
+  }
+
+  stage('Snapshot Agent Workspace to S3 bucket') {
+    //first delete the directory for overwriting
+    s3Delete bucket: "${workspace_snapshot_bucket}", path: "${env.JOB_NAME}/"
+
+    dir(app_checkout_dir) {
+      // create a zip of workspace
+      sh script: "zip -r Build-${env.BUILD_NUMBER}-Workspace-Snapshot.zip ${WORKSPACE}/${app_checkout_dir}/*"
+
+      //upload the workspace to s3
+      s3Upload bucket: "${workspace_snapshot_bucket}", file: "Build-${env.BUILD_NUMBER}-Workspace-Snapshot.zip", path: "${env.JOB_NAME}/Build-${env.BUILD_NUMBER}-Workspace-Snapshot.zip"
+    }
+
+    //send notification on Slack
+    def workspace_slack_attachment = [
+          [
+              text: "Workspace Snapshot [Build ${env.BUILD_NUMBER} of pipeline ${env.JOB_NAME}] has been to uploaded to S3 Bucket ${workspace_snapshot_bucket}",
+              fallback: 'Click on button to view the snapshot',
+              color: "good",
+              actions: [
+                  [
+                    type: "button",
+                    text: "View Pipeline Workspace",
+                    url: "https://console.aws.amazon.com/s3/buckets/${workspace_snapshot_bucket}/${env.JOB_NAME}/"
+                  ]
+              ]
+          ]
+      ]
+    slack_channels.each {
+      slackSend(channel: "${it}", attachments: workspace_slack_attachment)
+    }
+  }
+}
+
+def send_slack_notification(status, color) {
+  def slack_channels = ["#jb-automation", "#jb-android-pipeline"]
+  def slack_text = null
+  if(status) {
+    slack_text = "Build ${env.BUILD_NUMBER} of job ${env.JOB_NAME} has succeeded. Reports and Artifacts have been uploaded to S3 Bucket ${ARTIFACT_BUCKET}/${env.JOB_NAME}/${env.BUILD_NUMBER}/"
+  }
+  else {
+    slack_text = "Build ${env.BUILD_NUMBER} of job ${env.JOB_NAME} has failed"
+  }
+  def attachments = [
+        [
+            text: slack_text,
+            fallback: 'Click on button to view the build',
+            color: color,
+            actions: [
+                [
+                  type: "button",
+                  text: "View Pipeline",
+                  url: "${env.JENKINS_URL}blue/organizations/jenkins/${env.JOB_NAME}/detail/${env.JOB_NAME}/${env.BUILD_NUMBER}/pipeline"
+                ]
+            ]
+        ]
+    ]
+
+    if(status) {
+        def download_button = [
+          type: "button",
+          text: "Download Reports",
+          url: "https://console.aws.amazon.com/s3/buckets/${ARTIFACT_BUCKET}/${env.JOB_NAME}/${env.BUILD_NUMBER}/reports/"
+        ]
+        attachments[0].actions[1] = download_button
+    }
+    slack_channels.each {
+      slackSend(channel: "${it}", attachments: attachments)
+    }
+}
