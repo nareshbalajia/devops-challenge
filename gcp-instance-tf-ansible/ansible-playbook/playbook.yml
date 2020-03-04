@@ -2,10 +2,6 @@
 - hosts: localhost
   vars:
     instance_name: "webserver"
-    zone: "us-central1-1"
-    service_account_file: "/home/nareshbalajia/google-keys.json"
-    project: "gcp-selflearning"
-    auth_kind: "serviceaccount"
     pub_keys:
       - https://github.com/3mammoth.keys
   become: yes
