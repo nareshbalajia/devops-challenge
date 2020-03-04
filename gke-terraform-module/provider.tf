@@ -3,7 +3,7 @@
 # ---------------------------------
 
 provider "google" {
-  credentials = "${file("/home/naresh/google-cloud-keys/gcp-self.json")}"
+  credentials = "${file("key.json")}"
   project = "${var.project_name}"
   region = "${var.gcp_region}"
 }
